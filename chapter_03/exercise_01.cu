@@ -1,83 +1,140 @@
-#include <array>
 #include <vector>
 #include <iostream>
 #include <cuda_runtime.h>
 
-// Macro to catch silent hardware or launch failures
+
 #define cudaCheckError(ans) { gpuAssert((ans), __FILE__, __LINE__); }
-inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
-   if (code != cudaSuccess) {
-      std::cerr << "GPUassert: " << cudaGetErrorString(code) << " " << file << " " << line << std::endl;
-      if (abort) exit(code);
-   }
-}
 
-// dimX = Total Columns (Width), dimY = Total Rows (Height)
-__global__
-void matrixAddKernel_b(float *A, const float *B, const float *C, int dimX, int dimY) {
-
-    int col = threadIdx.x + blockIdx.x * blockDim.x; // X handles Columns
-    int row = threadIdx.y + blockIdx.y * blockDim.y; // Y handles Rows
-
-    // 1. FIXED: col checked against dimX, row checked against dimY
-    if (col < dimX && row < dimY) {
-
-        // 2. FIXED: Multiply row by Total Columns (dimX)
-        int idx = row * dimX + col;
-
-        A[idx] = C[idx] + B[idx];
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort = true) {
+    if (code != cudaSuccess) {
+        std::cerr << "GPUassert: " << cudaGetErrorString(code) << " " << file << " " << line << std::endl;
+        if (abort) exit(code);
     }
 }
 
+// ---------------------------------------------------------
+// VERSION 1: COALESCED (FAST)
+// Consecutive threads calculate consecutive columns in the same row.
+// ---------------------------------------------------------
+__global__
+void matrixAddCoalesced(float *A, const float *B, const float *C, int N) {
+    // 1D Thread ID
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < N * N) {
+        // Map 1D thread to 2D matrix: X-axis acts as Columns
+        int row = tid / N;
+        int col = tid % N;
+
+        // Flatten back to 1D index (Notice this just equals 'tid')
+        int idx = row * N + col;
+
+        A[idx] = B[idx] + C[idx];
+    }
+}
+
+// ---------------------------------------------------------
+// VERSION 2: STRIDED (SLOW)
+// Consecutive threads calculate consecutive rows in the same column.
+// ---------------------------------------------------------
+__global__
+void matrixAddStrided(float *A, const float *B, const float *C, int N) {
+    // 1D Thread ID
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (tid < N * N) {
+        // Map 1D thread to 2D matrix: X-axis acts as Rows (Flipped!)
+        int col = tid / N;
+        int row = tid % N;
+
+        // Flatten back to 1D index
+        // Thread 0 hits index 0. Thread 1 hits index N. Thread 2 hits 2N.
+        int idx = row * N + col;
+
+        A[idx] = B[idx] + C[idx];
+    }
+}
+
+// ---------------------------------------------------------
+// HOST LAUNCHER & PROFILER
+// ---------------------------------------------------------
 __host__
-void matrixAdd(float *A, const float *B, const float *C, const std::array<int, 2>& dim) {
-    const int size = dim[0] * dim[1] * sizeof(float);
+void runAndProfileKernels(int N) {
+    const int totalElements = N * N;
+    const size_t size = totalElements * sizeof(float);
+
+    std::vector<float> h_B(totalElements, 1.0f);
+    std::vector<float> h_C(totalElements, 2.0f);
+    std::vector<float> h_A(totalElements, 0.0f);
+
     float *d_A, *d_B, *d_C;
+    cudaCheckError(cudaMalloc((void **)&d_A, size));
+    cudaCheckError(cudaMalloc((void **)&d_B, size));
+    cudaCheckError(cudaMalloc((void **)&d_C, size));
 
-    // 3. ADDED: Error checking to catch missing GPU or out-of-memory errors
-    cudaCheckError(cudaMalloc(reinterpret_cast<void **>(&d_C), size));
-    cudaCheckError(cudaMemcpy(d_C, C, size, cudaMemcpyHostToDevice));
+    cudaCheckError(cudaMemcpy(d_B, h_B.data(), size, cudaMemcpyHostToDevice));
+    cudaCheckError(cudaMemcpy(d_C, h_C.data(), size, cudaMemcpyHostToDevice));
 
-    cudaCheckError(cudaMalloc(reinterpret_cast<void **>(&d_B), size));
-    cudaCheckError(cudaMemcpy(d_B, B, size, cudaMemcpyHostToDevice));
+    // 1D Hardware Configuration
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (totalElements + threadsPerBlock - 1) / threadsPerBlock;
 
-    cudaCheckError(cudaMalloc(reinterpret_cast<void **>(&d_A), size));
+    // Create CUDA events for precise hardware timing
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    // Define a 16x16 block
-    dim3 dimBlock(16, 16, 1);
+    int totalMonteCarloNumber = 1e3;
+    float milliseconds = 0;
 
-    // dim[0] is X (Columns), dim[1] is Y (Rows)
-    dim3 dimGrid((dim[0] + dimBlock.x - 1) / dimBlock.x,
-                 (dim[1] + dimBlock.y - 1) / dimBlock.y,
-                 1);
+    // --- Profile Coalesced ---
+    float totalMilliseconds = 0;
+    for (int i = 0; i < totalMonteCarloNumber; i++) {
+        cudaEventRecord(start);
+        matrixAddCoalesced<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, N);
+        cudaEventRecord(stop);
 
-    // Launch the kernel
-    matrixAddKernel_b<<<dimGrid, dimBlock>>>(d_A, d_B, d_C, dim[0], dim[1]);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        totalMilliseconds += milliseconds;
+    }
 
-    // Catch kernel execution errors (e.g., too many threads per block)
-    cudaCheckError(cudaDeviceSynchronize());
 
-    // Copy result back
-    cudaCheckError(cudaMemcpy(A, d_A, size, cudaMemcpyDeviceToHost));
+    std::cout << "Coalesced (Row-Major) Time: " << totalMilliseconds / totalMonteCarloNumber << " ms\n";
 
+    // --- Profile Strided ---
+    // Clear the output buffer to ensure a fair test
+    cudaMemset(d_A, 0, size);
+
+    totalMilliseconds = 0;
+    for (int i = 0; i < totalMonteCarloNumber; i++) {
+        cudaEventRecord(start);
+        matrixAddStrided<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, N);
+        cudaEventRecord(stop);
+
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&milliseconds, start, stop);
+        totalMilliseconds += milliseconds;
+    }
+
+    std::cout << "Strided (Col-Major) Time:   " << totalMilliseconds / totalMonteCarloNumber << " ms\n";
+
+    // Cleanup
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
 }
 
 int main() {
-    // dim[0] = Width (Columns), dim[1] = Height (Rows)
-    constexpr std::array<int, 2> dim{256, 256};
+    // A 10,000 x 10,000 matrix creates 100 Million threads.
+    // This size is large enough to force the GPU to work hard,
+    // making the memory traffic bottleneck very obvious.
+    int N = 10000;
 
-    constexpr int totalElements = dim[0] * dim[1];
-    std::vector<float> A(totalElements, 0.0f); // Output buffer
-    std::vector<float> B(totalElements, 2.0f);
-    std::vector<float> C(totalElements, 2.0f);
-
-    matrixAdd(A.data(), B.data(), C.data(), dim);
-
-    // Verify the result: Only print the first element to avoid flooding the terminal
-    std::cout << "Element A[0] = " << A[0] << " (Expected 4)" << std::endl;
+    std::cout << "Testing Matrix Addition with N = " << N << "...\n";
+    runAndProfileKernels(N);
 
     return 0;
 }
