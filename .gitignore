@@ -1,0 +1,12 @@
+# CMake and Build artifacts
+build/
+cmake-build-*/
+out/
+
+# CLion IDE specific files
+.idea/
+
+# Compiled binaries and PTX files
+*.ptx
+*.out
+*.exe
